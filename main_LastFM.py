@@ -2,19 +2,17 @@ import utils
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import datetime
-from sklearn import datasets
 import data
 import model
 import scipy.sparse as sp
-
 import argparse
-from tqdm import tqdm
-import pickle
 import scipy.sparse
+from pprint import pprint
+from utils import *
 
-np.random.seed(0)
-tf.set_random_seed(0)
+
+seed = 0
+set_seed(seed)
 
 
 def main():
@@ -42,7 +40,6 @@ def main():
     user_list = dat['user_list']
     item_list = dat['item_list']
     item_warm = np.unique(item_list)
-
     timer = utils.timer(name='main').tic()
 
     # prep eval
@@ -57,22 +54,18 @@ def main():
                           item_content_rank=0,
                           model_select=model_select,
                           rank_out=rank_out, reg=args.reg, alpha=args.alpha, dim=args.dim)
-
-    config = tf.ConfigProto(allow_soft_placement=True)
-
     heater.build_model()
     heater.build_predictor(recall_at)
 
+    config = tf.ConfigProto(allow_soft_placement=True)
     with tf.Session(config=config) as sess:
         tf.global_variables_initializer().run()
         tf.local_variables_initializer().run()
         timer.toc('initialized tf')
 
-        n_step = 0
-        best_recall = 0
-        best_test_recall = 0
-        best_step = 0
-        tf.local_variables_initializer().run()
+        best_epoch = 0
+        best_recall = 0  # val
+        best_test_recall = 0  # test
         for epoch in range(num_epoch):
             user_array, item_array, target_array = utils.negative_sampling(user_list, item_list, neg, item_warm)
             random_idx = np.random.permutation(user_array.shape[0])
@@ -81,11 +74,8 @@ def main():
             loss_epoch = 0.
             reg_loss_epoch = 0.
             diff_loss_epoch = 0.
-            expert_loss_epoch = 0.
-            gen = data_batch
-            gen = tqdm(gen)
-            for (start, stop) in gen:
-                n_step += 1
+            rec_loss_epoch = 0.
+            for (start, stop) in data_batch:
 
                 batch_idx = random_idx[start:stop]
                 batch_users = user_array[batch_idx]
@@ -104,9 +94,9 @@ def main():
                 if len(zero_index) > 0:
                     dropout_indicator[zero_index] = 1
 
-                _, _, loss_out, reg_loss_out, diff_loss_out = sess.run(
+                _, _, loss_out, rec_loss_out, reg_loss_out, diff_loss_out = sess.run(
                     [heater.preds, heater.optimizer, heater.loss,
-                     heater.reg_loss, heater.diff_loss],
+                     heater.rec_loss, heater.reg_loss, heater.diff_loss],
                     feed_dict={
                         heater.Uin: u_pref[batch_users, :],
                         heater.Vin: v_pref[batch_items, :],
@@ -118,6 +108,7 @@ def main():
                     }
                 )
                 loss_epoch += loss_out
+                rec_loss_out += rec_loss_out
                 reg_loss_epoch += reg_loss_out
                 diff_loss_epoch += diff_loss_out
                 if np.isnan(loss_epoch):
@@ -142,38 +133,21 @@ def main():
                 best_test_recall = test_recall
                 best_epoch = epoch
 
-            timer.toc('%d [%d]b loss=%.4f reg_loss=%.4f diff_loss=%.4f expert_loss=%.4f best[%d]' % (
-                epoch, len(data_batch), loss_epoch, reg_loss_epoch, diff_loss_epoch, expert_loss_epoch, best_step
+            # print results at every epoch
+            timer.toc('%d loss=%.4f reg_loss=%.4f diff_loss=%.4f rec_loss=%.4f' % (
+                epoch, loss_epoch / len(data_batch), reg_loss_epoch / len(data_batch),
+                diff_loss_epoch / len(data_batch), rec_loss_epoch / len(data_batch)
             )).tic()
-            print('\t\t\t' + '\t '.join([('@' + str(i)).ljust(6) for i in recall_at]))
-            print('Current recall\t\t%s' % (
-                ' '.join(['%.6f' % i for i in recall]),
-            ))
-            print('Current precision\t%s' % (
-                ' '.join(['%.6f' % i for i in precision]),
-            ))
-            print('Current ndcg\t\t%s' % (
-                ' '.join(['%.6f' % i for i in ndcg]),
-            ))
-
-            print('Current test recall\t\t%s' % (
-                ' '.join(['%.6f' % i for i in test_recall]),
-            ))
-            print('Current test precision\t%s' % (
-                ' '.join(['%.6f' % i for i in test_precision]),
-            ))
-            print('Current test ndcg\t\t%s' % (
-                ' '.join(['%.6f' % i for i in test_ndcg]),
-            ))
-
-            print('best epoch[%d]\t vali recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_recall]),
-            ))
-            print('best epoch[%d]\t test recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_test_recall]),
-            ))
+            print(
+                '\t\t\t' + '\t '.join([('@' + str(i)).ljust(6) for i in recall_at]))  # ljust: padding to fixed len
+            print('Current recall\t\t%s' % (' '.join(['%.6f' % i for i in recall])))
+            print('Current precision\t%s' % (' '.join(['%.6f' % i for i in precision])))
+            print('Current ndcg\t\t%s' % (' '.join(['%.6f' % i for i in ndcg])))
+            print('Current test recall\t%s' % (' '.join(['%.6f' % i for i in test_recall])))
+            print('Current test precision\t%s' % (' '.join(['%.6f' % i for i in test_precision])))
+            print('Current test ndcg\t%s' % (' '.join(['%.6f' % i for i in test_ndcg])))
+            print('best[%d] vali recall:\t%s' % (best_epoch, ' '.join(['%.6f' % i for i in best_recall])))
+            print('best[%d] test recall:\t%s' % (best_epoch, ' '.join(['%.6f' % i for i in best_test_recall])))
 
 
 def load_data(data_name):
@@ -185,27 +159,19 @@ def load_data(data_name):
     train_file = data_path + '/train.csv'
     test_file = data_path + '/test.csv'
     vali_file = data_path + '/vali.csv'
-    with open('./data/' + data_name + '/info.pkl', 'rb') as f:
-        info = pickle.load(f)
-        num_user = info['num_user']
-        num_item = info['num_item']
 
     dat = {}
     # load preference data
     timer.tic()
-
     u_pref = np.load(u_file)
     v_pref = np.load(v_file)
-
     dat['u_pref'] = u_pref
     dat['v_pref'] = v_pref
-
     timer.toc('loaded U:%s,V:%s' % (str(u_pref.shape), str(v_pref.shape))).tic()
 
     # pre-process
     _, dat['u_pref'] = utils.standardize_2(u_pref)
     _, dat['v_pref'] = utils.standardize(v_pref)
-
     timer.toc('standardized U,V').tic()
 
     # load content data
@@ -222,32 +188,27 @@ def load_data(data_name):
     dat['warm_item'] = np.unique(train['iid'].values)
     timer.toc('read train triplets %s' % str(train.shape)).tic()
 
-    dat['test_eval'] = data.load_eval_data(test_file, cold_user=True, test_item_ids=dat['warm_item'])
     dat['vali_eval'] = data.load_eval_data(vali_file, cold_user=True, test_item_ids=dat['warm_item'])
+    dat['test_eval'] = data.load_eval_data(test_file, cold_user=True, test_item_ids=dat['warm_item'])
     return dat
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="main_LastFM",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
+    parser = argparse.ArgumentParser(description="main_LastFM")
     parser.add_argument('--data', type=str, default='LastFM', help='path to eval in the downloaded folder')
-    parser.add_argument('--model-select', nargs='+', type=int,
-                        default=[200],
+    parser.add_argument('--model-select', nargs='+', type=int, default=[200],
                         help='specify the fully-connected architecture, starting from input,'
-                             ' numbers indicate numbers of hidden units',
-                        )
+                             ' numbers indicate numbers of hidden units')
     parser.add_argument('--rank', type=int, default=200, help='output rank of latent model')
     parser.add_argument('--dropout', type=float, default=0.5, help='dropout rate')
     parser.add_argument('--eval-every', type=int, default=1, help='evaluate every X user-batch')
     parser.add_argument('--neg', type=float, default=5, help='negative sampling rate')
     parser.add_argument('--lr', type=float, default=0.005, help='starting learning rate')
-    parser.add_argument('--alpha', type=float, default=0.0001, help='diff loss parameter')
+    parser.add_argument('--alpha', type=float, default=0.1, help='diff loss parameter')
     parser.add_argument('--reg', type=float, default=0.001, help='regularization')
     parser.add_argument('--dim', type=int, default=5, help='number of experts')
 
     args = parser.parse_args()
-    args, _ = parser.parse_known_args()
-    for key in vars(args):
-        print(key + ":" + str(vars(args)[key]))
+    pprint(vars(args))
+
     main()

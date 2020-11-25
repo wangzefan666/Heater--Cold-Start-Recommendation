@@ -2,18 +2,16 @@ import utils
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import datetime
-from sklearn import datasets
 import data
 import model
-
+from pprint import pprint
 import argparse
-import pickle
-from tqdm import tqdm
 import scipy.sparse
+from utils import *
 
-np.random.seed(0)
-tf.set_random_seed(0)
+
+seed = 0
+set_seed(seed)
 
 
 def main():
@@ -33,12 +31,8 @@ def main():
     _lr_decay = 0.8
 
     dat = load_data(data_name)
-    test_item_eval = dat['test_item_eval']
-    test_user_eval = dat['test_user_eval']
-    test_user_item_eval = dat['test_user_item_eval']
-    vali_item_eval = dat['vali_item_eval']
-    vali_user_eval = dat['vali_user_eval']
-    vali_user_item_eval = dat['vali_user_item_eval']
+    test_eval = dat['test_eval']
+    vali_eval = dat['vali_eval']
     user_content = dat['user_content']
     item_content = dat['item_content']
     u_pref = dat['u_pref']
@@ -46,64 +40,42 @@ def main():
     user_list = dat['user_list']
     item_list = dat['item_list']
     item_warm = np.unique(item_list)
-    user_warm = np.unique(user_list)
-
     timer = utils.timer(name='main').tic()
 
     # prep eval
-    eval_batch_size = eval_batch_size
     timer.tic()
-    test_item_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size,
-                                cold_user=True, cold_item=True)
-    test_user_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size,
-                                cold_user=True, cold_item=True)
-    test_user_item_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size,
-                                cold_user=True, cold_item=True)
-    vali_item_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size,
-                                cold_user=True, cold_item=True)
-    vali_user_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size,
-                                cold_user=True, cold_item=True)
-    vali_user_item_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size,
-                                cold_user=True, cold_item=True)
+    cold_user = True if args.type != 1 else False
+    cold_item = True if args.type != 2 else False
+    test_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size, cold_user=cold_user, cold_item=cold_item)
+    vali_eval.init_tf(u_pref, v_pref, user_content, item_content, eval_batch_size, cold_user=cold_user, cold_item=cold_item)
 
     heater = model.Heater(latent_rank_in=u_pref.shape[1],
-                               user_content_rank=user_content.shape[1],
-                               item_content_rank=item_content.shape[1],
-                               model_select=model_select,
-                               rank_out=rank_out, reg=args.reg, alpha=args.alpha, dim=args.dim)
-
-    config = tf.ConfigProto(allow_soft_placement=True)
-
+                          user_content_rank=user_content.shape[1] if cold_user else 0,
+                          item_content_rank=item_content.shape[1] if cold_item else 0,
+                          model_select=model_select,
+                          rank_out=rank_out, reg=args.reg, alpha=args.alpha, dim=args.dim)
     heater.build_model()
     heater.build_predictor(recall_at)
 
+    config = tf.ConfigProto(allow_soft_placement=True)
     with tf.Session(config=config) as sess:
         tf.global_variables_initializer().run()
         tf.local_variables_initializer().run()
         timer.toc('initialized tf')
 
-        n_step = 0
-        best_recall_item = [0, 0, 0]
-        best_recall_user = [0, 0, 0]
-        best_recall_user_item = [0, 0, 0]
-        best_test_item_recall = [0, 0, 0]
-        best_test_user_recall = [0, 0, 0]
-        best_test_user_item_recall = [0, 0, 0]
-        best_step = 0
-        tf.local_variables_initializer().run()
+        best_epoch = 0
+        best_recall = 0  # val
+        best_test_recall = 0  # test
         for epoch in range(num_epoch):
             user_array, item_array, target_array = utils.negative_sampling(user_list, item_list, neg, item_warm)
             random_idx = np.random.permutation(user_array.shape[0])
             n_targets = len(random_idx)
             data_batch = [(n, min(n + data_batch_size, n_targets)) for n in range(0, n_targets, data_batch_size)]
             loss_epoch = 0.
+            rec_loss_epoch = 0.
             reg_loss_epoch = 0.
             diff_loss_epoch = 0.
-            expert_loss_epoch = 0.
-            gen = data_batch
-            gen = tqdm(gen)
-            for (start, stop) in gen:
-                n_step += 1
+            for (start, stop) in data_batch:
 
                 batch_idx = random_idx[start:stop]
                 batch_users = user_array[batch_idx]
@@ -128,9 +100,9 @@ def main():
                 if len(zero_user_index) > 0:
                     dropout_user_indicator[zero_user_index] = 1
 
-                _, _, loss_out, reg_loss_out, diff_loss_out = sess.run(
+                _, _, loss_out, rec_loss_out, reg_loss_out, diff_loss_out = sess.run(
                     [heater.preds, heater.optimizer, heater.loss,
-                     heater.reg_loss, heater.diff_loss],
+                     heater.rec_loss, heater.reg_loss, heater.diff_loss],
                     feed_dict={
                         heater.Uin: u_pref[batch_users, :],
                         heater.Vin: v_pref[batch_items, :],
@@ -144,6 +116,7 @@ def main():
                     }
                 )
                 loss_epoch += loss_out
+                rec_loss_epoch += rec_loss_out
                 reg_loss_epoch += reg_loss_out
                 diff_loss_epoch += diff_loss_out
                 if np.isnan(loss_epoch):
@@ -154,156 +127,34 @@ def main():
                 print('decayed lr:' + str(_lr))
 
             if epoch % eval_every == 0:
-                recall_vali_item, precision_vali_item, \
-                ndcg_vali_item = utils.batch_eval_recall(sess, heater.eval_preds_cold,
-                                                         eval_feed_dict=heater.get_eval_dict,
-                                                         recall_k=recall_at, eval_data=vali_item_eval)
-                print('vali item done!')
-                recall_vali_user, precision_vali_user, \
-                ndcg_vali_user = utils.batch_eval_recall(sess, heater.eval_preds_cold,
-                                                         eval_feed_dict=heater.get_eval_dict,
-                                                         recall_k=recall_at, eval_data=vali_user_eval)
-                print('vali user done!')
-                recall_vali_user_item, precision_vali_user_item, \
-                ndcg_vali_user_item = utils.batch_eval_recall(sess, heater.eval_preds_cold,
-                                                              eval_feed_dict=heater.get_eval_dict,
-                                                              recall_k=recall_at, eval_data=vali_user_item_eval)
-                print('vali user-item done!')
+                recall, precision, ndcg = utils.batch_eval_recall(sess, heater.eval_preds_cold,
+                                                                  eval_feed_dict=heater.get_eval_dict,
+                                                                  recall_k=recall_at, eval_data=vali_eval)
 
-            is_best = False
-            if (np.sum(recall_vali_item)
-                + np.sum(recall_vali_user)
-                + np.sum(recall_vali_user_item)) > (np.sum(best_recall_item)
-                                                    + np.sum(best_recall_user)
-                                                    + np.sum(best_recall_user_item)):
-                is_best = True
+            if np.sum(recall) > np.sum(best_recall):
+                best_recall = recall
+                test_recall, test_precision, test_ndcg = utils.batch_eval_recall(sess, heater.eval_preds_cold,
+                                                                                 eval_feed_dict=heater.get_eval_dict,
+                                                                                 recall_k=recall_at, eval_data=test_eval)
 
-                best_recall_item = recall_vali_item
-                best_recall_user = recall_vali_user
-                best_recall_user_item = recall_vali_user_item
-
-                recall_test_item, precision_test_item, \
-                ndcg_test_item = utils.batch_eval_recall(sess, heater.eval_preds_cold,
-                                                         eval_feed_dict=heater.get_eval_dict,
-                                                         recall_k=recall_at, eval_data=test_item_eval)
-                print('test item done!')
-                recall_test_user, precision_test_user, \
-                ndcg_test_user = utils.batch_eval_recall(sess, heater.eval_preds_cold,
-                                                         eval_feed_dict=heater.get_eval_dict,
-                                                         recall_k=recall_at, eval_data=test_user_eval)
-                print('test user done!')
-                recall_test_user_item, precision_test_user_item, \
-                ndcg_test_user_item = utils.batch_eval_recall(sess, heater.eval_preds_cold,
-                                                              eval_feed_dict=heater.get_eval_dict,
-                                                              recall_k=recall_at, eval_data=test_user_item_eval)
-                print('test user-item done!')
-
-                best_test_item_recall = recall_test_item
-                best_test_user_recall = recall_test_user
-                best_test_user_item_recall = recall_test_user_item
+                best_test_recall = test_recall
                 best_epoch = epoch
 
-            timer.toc('%d [%d]b loss=%.4f reg_loss=%.4f diff_loss=%.4f expert_loss=%.4f best[%d]' % (
-                epoch, len(data_batch), loss_epoch, reg_loss_epoch, diff_loss_epoch, expert_loss_epoch, best_step
+            # print results at every epoch
+            timer.toc('%d loss=%.4f reg_loss=%.4f diff_loss=%.4f rec_loss=%.4f' % (
+                epoch, loss_epoch / len(data_batch), reg_loss_epoch / len(data_batch),
+                diff_loss_epoch / len(data_batch), rec_loss_epoch / len(data_batch)
             )).tic()
-            print('\t\t\t' + '\t '.join([('@' + str(i)).ljust(6) for i in recall_at]))
-            print('Current item recall\t\t%s' % (
-                ' '.join(['%.6f' % i for i in recall_vali_item]),
-            ))
-            print('Current item precision\t%s' % (
-                ' '.join(['%.6f' % i for i in precision_vali_item]),
-            ))
-            print('Current item ndcg\t\t%s' % (
-                ' '.join(['%.6f' % i for i in ndcg_vali_item]),
-            ))
-
-            print('-' * 30)
-
-            print('Current user recall\t\t%s' % (
-                ' '.join(['%.6f' % i for i in recall_vali_user]),
-            ))
-            print('Current user precision\t%s' % (
-                ' '.join(['%.6f' % i for i in precision_vali_user]),
-            ))
-            print('Current user ndcg\t\t%s' % (
-                ' '.join(['%.6f' % i for i in ndcg_vali_user]),
-            ))
-
-            print('-' * 30)
-
-            print('Current user-item recall\t\t%s' % (
-                ' '.join(['%.6f' % i for i in recall_vali_user_item]),
-            ))
-            print('Current user-item precision\t%s' % (
-                ' '.join(['%.6f' % i for i in precision_vali_user_item]),
-            ))
-            print('Current user-item ndcg\t\t%s' % (
-                ' '.join(['%.6f' % i for i in ndcg_vali_user_item]),
-            ))
-
-            if is_best:
-                print('=' * 50)
-
-                print('Current test item recall\t\t%s' % (
-                    ' '.join(['%.6f' % i for i in recall_test_item]),
-                ))
-                print('Current test item precision\t%s' % (
-                    ' '.join(['%.6f' % i for i in precision_test_item]),
-                ))
-                print('Current test item ndcg\t\t%s' % (
-                    ' '.join(['%.6f' % i for i in ndcg_test_item]),
-                ))
-
-                print('-' * 30)
-
-                print('Current test user recall\t\t%s' % (
-                    ' '.join(['%.6f' % i for i in recall_test_user]),
-                ))
-                print('Current test user precision\t%s' % (
-                    ' '.join(['%.6f' % i for i in precision_test_user]),
-                ))
-                print('Current test user ndcg\t\t%s' % (
-                    ' '.join(['%.6f' % i for i in ndcg_test_user]),
-                ))
-
-                print('-' * 30)
-
-                print('Current test user-item recall\t\t%s' % (
-                    ' '.join(['%.6f' % i for i in recall_test_user_item]),
-                ))
-                print('Current test user-item precision\t%s' % (
-                    ' '.join(['%.6f' % i for i in precision_test_user_item]),
-                ))
-                print('Current test user-item ndcg\t\t%s' % (
-                    ' '.join(['%.6f' % i for i in ndcg_test_user_item]),
-                ))
-
-            print('=' * 50)
-
-            print('best epoch[%d]\t vali item recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_recall_item]),
-            ))
-            print('best epoch[%d]\t vali user recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_recall_user]),
-            ))
-            print('best epoch[%d]\t vali user-item recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_recall_user_item]),
-            ))
-            print('best epoch[%d]\t test item recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_test_item_recall]),
-            ))
-            print('best epoch[%d]\t test user recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_test_user_recall]),
-            ))
-            print('best epoch[%d]\t test user-item recall: %s' % (
-                best_epoch,
-                ' '.join(['%.6f' % i for i in best_test_user_item_recall]),
-            ))
+            print(
+                '\t\t\t' + '\t '.join([('@' + str(i)).ljust(6) for i in recall_at]))  # ljust: padding to fixed len
+            print('Current recall\t\t%s' % (' '.join(['%.6f' % i for i in recall])))
+            print('Current precision\t%s' % (' '.join(['%.6f' % i for i in precision])))
+            print('Current ndcg\t\t%s' % (' '.join(['%.6f' % i for i in ndcg])))
+            print('Current test recall\t%s' % (' '.join(['%.6f' % i for i in test_recall])))
+            print('Current test precision\t%s' % (' '.join(['%.6f' % i for i in test_precision])))
+            print('Current test ndcg\t%s' % (' '.join(['%.6f' % i for i in test_ndcg])))
+            print('best[%d] vali recall:\t%s' % (best_epoch, ' '.join(['%.6f' % i for i in best_recall])))
+            print('best[%d] test recall:\t%s' % (best_epoch, ' '.join(['%.6f' % i for i in best_test_recall])))
 
 
 def load_data(data_name):
@@ -314,25 +165,16 @@ def load_data(data_name):
     user_content_file = data_path + '/user_content.npz'
     item_content_file = data_path + '/item_content.npz'
     train_file = data_path + '/train.csv'
-    vali_item_file = data_path + '/vali_item.csv'
-    vali_user_file = data_path + '/vali_user.csv'
-    vali_user_item_file = data_path + '/vali_user_item.csv'
-    test_item_file = data_path + '/test_item.csv'
-    test_user_file = data_path + '/test_user.csv'
-    test_user_item_file = data_path + '/test_user_item.csv'
-    with open('./data/' + data_name + '/info.pkl', 'rb') as f:
-        info = pickle.load(f)
-        num_user = info['num_user']
-        num_item = info['num_item']
-
+    vali_file = [data_path + '/vali_user_item.csv', data_path + '/vali_item.csv', data_path + '/vali_user.csv']
+    test_file = [data_path + '/test_user_item.csv', data_path + '/test_item.csv', data_path + '/test_user.csv']
     dat = {}
+
     # load preference data
     timer.tic()
     u_pref = np.load(u_file)
     v_pref = np.load(v_file)
     dat['u_pref'] = u_pref
     dat['v_pref'] = v_pref
-
     timer.toc('loaded U:%s,V:%s' % (str(u_pref.shape), str(v_pref.shape))).tic()
 
     # pre-process
@@ -356,22 +198,18 @@ def load_data(data_name):
     dat['warm_item'] = np.unique(train['iid'].values)
     timer.toc('read train triplets %s' % str(train.shape)).tic()
 
-    dat['test_item_eval'] = data.load_eval_data(test_item_file)
-    dat['test_user_eval'] = data.load_eval_data(test_user_file, cold_user=True, test_item_ids=dat['warm_item'])
-    dat['test_user_item_eval'] = data.load_eval_data(test_user_item_file)
-    dat['vali_item_eval'] = data.load_eval_data(vali_item_file)
-    dat['vali_user_eval'] = data.load_eval_data(vali_user_file, cold_user=True, test_item_ids=dat['warm_item'])
-    dat['vali_user_item_eval'] = data.load_eval_data(vali_user_item_file)
+    cold_user = True if args.type == 2 else False
+    test_item_ids = dat['warm_item'] if args.type == 2 else None
+    dat['test_eval'] = data.load_eval_data(test_file[args.type], cold_user=cold_user, test_item_ids=test_item_ids)
+    dat['vali_eval'] = data.load_eval_data(vali_file[args.type], cold_user=cold_user, test_item_ids=test_item_ids)
     return dat
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="main_XING",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = argparse.ArgumentParser(description="main_XING")
 
     parser.add_argument('--data', type=str, default='XING', help='path to eval in the downloaded folder')
-    parser.add_argument('--model-select', nargs='+', type=int,
-                        default=[200],
+    parser.add_argument('--model-select', nargs='+', type=int, default=[200],
                         help='specify the fully-connected architecture, starting from input,'
                              ' numbers indicate numbers of hidden units')
     parser.add_argument('--rank', type=int, default=200, help='output rank of latent model')
@@ -379,12 +217,12 @@ if __name__ == "__main__":
     parser.add_argument('--eval-every', type=int, default=1, help='evaluate every X user-batch')
     parser.add_argument('--neg', type=float, default=5, help='negative sampling rate')
     parser.add_argument('--lr', type=float, default=0.005, help='starting learning rate')
-    parser.add_argument('--alpha', type=float, default=0.0001, help='diff loss parameter')
+    parser.add_argument('--alpha', type=float, default=0.1, help='diff loss parameter')
     parser.add_argument('--reg', type=float, default=0.0001, help='regularization')
     parser.add_argument('--dim', type=int, default=5, help='number of experts')
+    parser.add_argument('--type', type=int, default=0, help='type of cold start - 0:user-item, 1:item, 2:user')
 
     args = parser.parse_args()
-    args, _ = parser.parse_known_args()
-    for key in vars(args):
-        print(key + ":" + str(vars(args)[key]))
+    pprint(vars(args))
+
     main()

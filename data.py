@@ -12,8 +12,10 @@ This module contains class and methods related to data used in Heater
 def load_eval_data(test_file, cold_user=False, test_item_ids=None):
     timer = utils.timer()
     test = pd.read_csv(test_file, dtype=np.int32)
+    # if not cold_user: 测试集中所有item
+    # if cold_user: 训练集中的所有item
     if not cold_user:
-        test_item_ids = list(set(test['iid'].values))  # 测试集中所有item
+        test_item_ids = list(set(test['iid'].values))
     # ravel(): to flatten a array
     # view 可以使 array 可以按照列名访问某一列
     test_data = test.values.ravel().view(dtype=[('uid', np.int32), ('iid', np.int32)])
@@ -55,7 +57,10 @@ class EvalData:
         self.test_user_ids = np.unique(test_triplets['uid'])
         self.test_user_ids_map = {user_id: i for i, user_id in enumerate(self.test_user_ids)}
 
-        # 如果 cold user=False，那 if 必然成立
+        # ① 如果 cold user=False, item来自测试集, if 必然成立 /
+        # ② 如果 cold user=True, item来自训练集, 除非测试集中的item是训练集中的item的子集, 否则if不一定成立
+        # 情况②在 lastFM 出现了, 测试集中有不属于训练集的item, 甚至还出现了刚好只和这些item有interaction的user
+        # 这个if大概block了情况②中15%的interactions
         _test_ij_for_inf = [(t[0], t[1]) for t in test_triplets if t[1] in self.test_item_ids_map]
         _test_i_for_inf = [self.test_user_ids_map[_t[0]] for _t in _test_ij_for_inf]
         _test_j_for_inf = [self.test_item_ids_map[_t[1]] for _t in _test_ij_for_inf]
@@ -107,7 +112,7 @@ class EvalData:
             if scipy.sparse.issparse(self.V_content_test):
                 self.V_content_test = self.V_content_test.todense()
 
-        # get every batch's start index and end index for **user**
+        # get every batch's start index and end index for **users**
         eval_l = self.R_test_inf.shape[0]  # num of test users
         self.eval_batch = [(x, min(x + eval_run_batchsize, eval_l)) for x in range(0, eval_l, eval_run_batchsize)]
 
