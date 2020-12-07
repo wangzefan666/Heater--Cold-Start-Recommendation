@@ -82,14 +82,14 @@ def main():
                 batch_items = item_array[batch_idx]
                 batch_targets = target_array[batch_idx]
 
+                # content
+                user_content_batch = user_content[batch_users, :].todense()
                 # dropout
                 if dropout != 0:
                     n_to_drop = int(np.floor(dropout * len(batch_idx)))  # number of u-i pairs to be dropped
                     zero_index = np.random.choice(np.arange(len(batch_idx)), n_to_drop, replace=False)
                 else:
                     zero_index = np.array([])
-
-                user_content_batch = user_content[batch_users, :].todense()
                 dropout_indicator = np.zeros_like(batch_targets).reshape((-1, 1))
                 if len(zero_index) > 0:
                     dropout_indicator[zero_index] = 1
