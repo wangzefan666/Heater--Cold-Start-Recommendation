@@ -1,7 +1,7 @@
 import time
 import datetime
 import numpy as np
-import scipy
+import scipy.sparse as sp
 import tensorflow as tf
 from sklearn import preprocessing as prep
 import random
@@ -83,7 +83,7 @@ def tfidf(R):
     tf.data = np.log(tf.data)
     idf = np.sum(Rbin, 0)
     idf = np.log(row / (1 + idf))
-    idf = scipy.sparse.spdiags(idf, 0, col, col)
+    idf = sp.spdiags(idf, 0, col, col)
     return tf * idf
 
 
@@ -189,19 +189,19 @@ def batch_eval_recall(_sess, tf_eval, eval_feed_dict, recall_k, eval_data):
     precision = []
     ndcg = []
     for at_k in recall_k:
-        y = eval_data.R_test_inf[y_nz, :].todense().A  # all test interactions
+        y = eval_data.R_test_inf[y_nz, :]
 
         preds_k = preds_all[:, :at_k]  # 排过序排过序，tf_eval是通过tf.nn.top_k得到的下标数组
-        x = scipy.sparse.lil_matrix(y.shape)  # @k all test predictions
-        x.rows = preds_k
-        x.data = np.ones_like(preds_k)
+        row = np.array([[i] * at_k for i in range(len(preds_k))], dtype=np.int).flatten()
+        col = preds_k.flatten()
+        x = sp.coo_matrix((np.ones(preds_k.size), (row, col)), shape=y.shape)  # @k all test predictions
 
-        z = np.multiply(y, x.todense().A)  # @k test predictions filtered by interactions
+        z = y.multiply(x)  # @k test predictions filtered by interactions
         recall.append(np.mean(np.divide(np.sum(z, 1), np.sum(y, 1))))
         precision.append(np.mean(np.sum(z, 1) / at_k))
 
-        x.data = np.ones_like(preds_k) * idcg_array[:at_k].reshape((1, -1))  # give weights to @n items
-        z = np.multiply(y, x.todense().A)  # @k test predictions with rank weights filtered by interactions
+        x.data = (np.ones_like(preds_k) * idcg_array[:at_k].reshape((1, -1))).flatten()  # give weights to @n items
+        z = y.multiply(x)  # @k test predictions with rank weights filtered by interactions
         dcg = np.sum(z, axis=1)
         idcg = np.sum(y, axis=1) - 1  # -1是因为idcg_table的下标
         idcg[idcg >= at_k] = at_k - 1
